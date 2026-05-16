@@ -5,6 +5,8 @@ Az **Erdővédők** egy valós idejű, szerver nélküli multiplayer ügyességi
 ![Erdővédők Banner](https://img.shields.io/badge/Erdővédők-v2.0-green?style=for-the-badge&logo=treehouse)
 ![Tech Stack](https://img.shields.io/badge/Tech-Python_|_Firebase_|_WebSocket-blue?style=for-the-badge)
 
+🌐 **Élő Weboldal**: [erdovedok.fandras.eu](https://erdovedok.fandras.eu)
+
 ## ✨ Főbb Funkciók
 
 - **Valós Idejű Multiplayer**: Versenyezz barátaiddal (LAN vagy Internet) egy 350 méteres 3D-hatású pályán.
