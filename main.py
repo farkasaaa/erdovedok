@@ -6,9 +6,34 @@ import random
 import time
 import threading
 import webbrowser
+import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import websockets
 import webview
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+import sys
+import os
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+try:
+    cred = credentials.Certificate(resource_path('serviceaccountkey.json'))
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    print("Firebase Admin sikeresen inicializálva!")
+except Exception as e:
+    print(f"Hiba a Firebase Admin inicializálásakor (a szerver pontokat nem fog menteni): {e}")
+    db = None
 
 KVIZ_KERDESEK = [
     {
@@ -241,6 +266,12 @@ async def kerdes_indit(szoba_id, aktivalo_ws):
 
     if aktivalo_ws in jatekosok:
         jatekosok[aktivalo_ws]["pont"] = jatekosok[aktivalo_ws].get("pont", 0) + 5
+        uid = jatekosok[aktivalo_ws].get("uid")
+        if db and uid:
+            def update_db():
+                try: db.collection("users").document(uid).update({"points": firestore.Increment(5)})
+                except: pass
+            asyncio.create_task(asyncio.to_thread(update_db))
         await kuldes(aktivalo_ws, {
             "tipus": "rendszer_uzenet",
             "szoveg": "🏆 Elsőként aktiváltad az akadályt! +5 BONUS PONT!"
@@ -388,12 +419,15 @@ async def kezel(ws):
                 
                 if tipus == "csatlakozas":
                     nev = uzenet.get("nev", "Játékos")[:20]
+                    uid = uzenet.get("uid", None)
+                    kezdo_pont = uzenet.get("pont", 0)
                     szin_lista = ["#7ec8a0", "#f4a261", "#84b6e0", "#c9a0dc", "#f7c59f"]
                     szin = random.choice(szin_lista)
                     jatekosok[ws] = {
                         "nev": nev,
+                        "uid": uid,
                         "szin": szin,
-                        "pont": 0,
+                        "pont": kezdo_pont,
                         "ero": 100,
                         "x": 0,
                         "y": 0,
@@ -402,8 +436,16 @@ async def kezel(ws):
                     }
                     
                     szoba_id = uzenet.get("szoba_id")
-                    if szoba_id and szoba_id in szobak and len(szobak[szoba_id]["jatekosok"]) < 4:
-                        szobak[szoba_id]["jatekosok"].append(ws)
+                    if szoba_id:
+                        if szoba_id in szobak:
+                            if len(szobak[szoba_id]["jatekosok"]) < 4:
+                                szobak[szoba_id]["jatekosok"].append(ws)
+                            else:
+                                await kuldes(ws, {"tipus": "hiba", "uzenet": "A szoba megtelt! (Max 4 fő)"})
+                                return
+                        else:
+                            await kuldes(ws, {"tipus": "hiba", "uzenet": "A megadott szoba nem létezik!"})
+                            return
                     else:
                         szoba_id = uj_szoba_id()
                         szobak[szoba_id] = {
@@ -579,35 +621,178 @@ HTML_TARTALOM = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Erdővédők 🌳</title>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getAuth, onAuthStateChanged, signInWithPopup, GoogleAuthProvider, signInWithEmailAndPassword, createUserWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import { getFirestore, doc, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyCep9a2p0w0haiE7q7UFT069eRBJsz6J58",
+    authDomain: "erdovedok-e4eb8.firebaseapp.com",
+    projectId: "erdovedok-e4eb8",
+    storageBucket: "erdovedok-e4eb8.firebasestorage.app",
+    messagingSenderId: "432347080621",
+    appId: "1:432347080621:web:9deed5158813602a95a324"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  window.auth = getAuth(app);
+  window.db = getFirestore(app);
+  window.signInWithPopup = signInWithPopup;
+  window.GoogleAuthProvider = GoogleAuthProvider;
+  window.signInWithEmailAndPassword = signInWithEmailAndPassword;
+  window.createUserWithEmailAndPassword = createUserWithEmailAndPassword;
+  
+  window.global_uid = null;
+  window.global_points = 0;
+  window.global_name = "Játékos";
+
+  window.loadLeaderboard = async () => {
+    try {
+      const { collection, query, orderBy, limit, getDocs } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
+      const q = query(collection(window.db, "users"), orderBy("points", "desc"), limit(5));
+      const querySnapshot = await getDocs(q);
+      const list = document.getElementById('leaderboard-list');
+      list.innerHTML = '';
+      querySnapshot.forEach((doc) => {
+        const data = doc.data();
+        const li = document.createElement('li');
+        li.className = 'rangsor-elem';
+        li.innerHTML = `<span>${data.displayName}</span> <span class="rangsor-pont">${data.points} pont</span>`;
+        list.appendChild(li);
+      });
+    } catch (e) { console.error(e); }
+  };
+
+  onAuthStateChanged(window.auth, async (user) => {
+    if (user) {
+      window.global_uid = user.uid;
+      window.global_name = user.displayName || user.email.split('@')[0];
+      const userRef = doc(window.db, "users", user.uid);
+      let docSnap = await getDoc(userRef);
+      if (!docSnap.exists()) {
+        await setDoc(userRef, { displayName: window.global_name, points: 0, rank: 'Újonc', friends: [] });
+        window.global_points = 0;
+      } else {
+        window.global_points = docSnap.data().points || 0;
+      }
+      document.getElementById('auth-section').style.display = 'none';
+      document.getElementById('play-section').style.display = 'flex';
+      document.getElementById('welcome-name').innerText = window.global_name;
+      window.loadLeaderboard();
+    } else {
+      document.getElementById('auth-section').style.display = 'block';
+      document.getElementById('play-section').style.display = 'none';
+    }
+  });
+
+  document.addEventListener('DOMContentLoaded', () => {
+    // Auth Tabs Logic
+    const tabLogin = document.getElementById('tab-login');
+    const tabReg = document.getElementById('tab-register');
+    const formLogin = document.getElementById('login-form');
+    const formReg = document.getElementById('register-form');
+    const msg = document.getElementById('auth-msg-local');
+
+    if (tabLogin && tabReg) {
+        tabLogin.onclick = () => {
+            tabLogin.classList.add('active'); tabReg.classList.remove('active');
+            formLogin.style.display = 'block'; formReg.style.display = 'none';
+            msg.innerText = '';
+        };
+        tabReg.onclick = () => {
+            tabReg.classList.add('active'); tabLogin.classList.remove('active');
+            formLogin.style.display = 'none'; formReg.style.display = 'block';
+            msg.innerText = '';
+        };
+    }
+
+    const btnLogin = document.getElementById('btn-do-login');
+    if (btnLogin) {
+      btnLogin.onclick = async () => {
+        const email = document.getElementById('login-email').value;
+        const pass = document.getElementById('login-pass').value;
+        if (!email || !pass) { msg.innerText = "Email és jelszó kötelező!"; return; }
+        
+        msg.innerText = "Töltés..."; msg.style.color = "var(--p-text)";
+        btnLogin.classList.add('betolt');
+        
+        try {
+          await window.signInWithEmailAndPassword(window.auth, email, pass);
+          msg.innerText = "";
+        } catch (err) {
+          msg.innerText = "Belépési hiba: Hibás e-mail vagy jelszó!";
+          msg.style.color = "var(--p-danger)";
+        }
+        btnLogin.classList.remove('betolt');
+      };
+    }
+    
+    const btnReg = document.getElementById('btn-do-register');
+    if (btnReg) {
+      btnReg.onclick = async () => {
+        const email = document.getElementById('reg-email').value;
+        const pass = document.getElementById('reg-pass').value;
+        const name = document.getElementById('reg-name').value || "Játékos";
+        const country = document.getElementById('reg-country').value || "Ismeretlen";
+        
+        if (!email || !pass || !document.getElementById('reg-name').value || !document.getElementById('reg-country').value) { 
+            msg.innerText = "Minden mező kitöltése kötelező!"; return; 
+        }
+        
+        msg.innerText = "Regisztráció folyamatban..."; msg.style.color = "var(--p-text)";
+        btnReg.classList.add('betolt');
+        
+        try {
+          const userCred = await window.createUserWithEmailAndPassword(window.auth, email, pass);
+          await window.setDoc(window.doc(window.db, "users", userCred.user.uid), {
+              displayName: name, country: country, points: 0, rank: 'Újonc', friends: []
+          });
+          msg.innerText = "";
+        } catch (regErr) {
+          msg.innerText = "Regisztrációs hiba: " + regErr.message;
+          msg.style.color = "var(--p-danger)";
+        }
+        btnReg.classList.remove('betolt');
+      };
+    }
+  });
+</script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;900&family=Fredoka+One&display=swap');
   :root {
-    --p-green: #588157;
-    --p-green-light: #84a98c;
-    --p-text: #354f52;
-    --p-bg: #fefae0;
-    --p-bg-dark: #e9e5c9;
-    --p-accent: #e9c46a;
-    --p-danger: #e76f51;
-    --p-shadow: rgba(53, 79, 82, 0.08);
-    --p-shadow-strong: rgba(53, 79, 82, 0.15);
+    --p-green: #10b981;
+    --p-green-light: #064e3b;
+    --p-text: #f8fafc;
+    --p-text-muted: #94a3b8;
+    --p-bg: #020617;
+    --p-bg-dark: #022c22;
+    --p-accent: #fcd34d;
+    --p-danger: #ef4444;
+    --p-glass: rgba(15, 23, 42, 0.7);
+    --p-glass-border: rgba(255, 255, 255, 0.1);
+    --p-shadow: rgba(0, 0, 0, 0.5);
+    --p-shadow-strong: rgba(16, 185, 129, 0.2);
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
     font-family: 'Nunito', sans-serif;
-    background: var(--p-bg);
+    background: linear-gradient(135deg, var(--p-bg), var(--p-bg-dark));
     color: var(--p-text);
     overflow: hidden;
     height: 100vh;
   }
-  .kepernyo { display: none; position: absolute; inset: 0; }
+  .firefly { position: absolute; width: 4px; height: 4px; background: #a7f3d0; border-radius: 50%; box-shadow: 0 0 10px 2px rgba(16, 185, 129, 0.5); animation: blink 4s infinite alternate; pointer-events: none; z-index: 1; }
+  @keyframes blink { 0%, 100% { opacity: 0; } 50% { opacity: 1; } }
+  .kepernyo { display: none; position: absolute; inset: 0; z-index: 2; }
   .kepernyo.aktiv { display: flex; animation: fadeIn .3s ease; }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  
   #betolto {
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    background: var(--p-green-light);
+    background: var(--p-bg);
   }
   .logo-fa { font-size: 5rem; animation: lebeg 2s ease-in-out infinite; }
   @keyframes lebeg { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-12px)} }
@@ -615,152 +800,164 @@ HTML_TARTALOM = r"""<!DOCTYPE html>
     font-family: 'Fredoka One', cursive;
     font-size: 3.5rem;
     color: var(--p-green);
-    text-shadow: 3px 3px 0 rgba(0,0,0,.1);
+    text-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
     margin: 1rem 0 0.5rem;
   }
   .logo-al { color: var(--p-text); font-size: 1.1rem; opacity: .8; }
-  .betolto-sor { width: 200px; height: 8px; background: rgba(255,255,255,.5); border-radius: 99px; margin-top: 2rem; overflow: hidden; }
-  .betolto-tolt { height: 100%; background: var(--p-green); border-radius: 99px; animation: tolt 2s ease forwards; }
-  @keyframes tolt { from{width:0} to{width:100%} }
-  .keszitok { position: absolute; bottom: 1.5rem; font-size: .85rem; color: var(--p-text); opacity: .7; }
-  #fomenu { flex-direction: column; align-items: center; justify-content: center; background: var(--p-bg); }
-  .menu-kart {
-    background: white;
-    border-radius: 16px;
-    padding: 2.5rem;
-    width: min(440px, 95vw);
-    box-shadow: 0 8px 24px var(--p-shadow-strong);
-    border: 1px solid var(--p-bg-dark);
+  .betolto-sor { width: 200px; height: 8px; background: rgba(255,255,255,.1); border-radius: 99px; margin-top: 2rem; overflow: hidden; }
+  .betolto-tolt { height: 100%; width: 0%; background: var(--p-green); border-radius: 99px; animation: load 2s forwards; }
+  @keyframes load { to { width: 100%; } }
+  .keszitok { margin-top: 1rem; font-size: 0.8rem; opacity: 0.5; }
+
+  .menu-kart, .lobby-kart, .tutorial-kart, .kviz-kart, .eredmeny-kart {
+    background: var(--p-glass);
+    backdrop-filter: blur(35px);
+    border: none;
+    border-radius: 0;
+    padding: 4rem;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    box-shadow: none;
+    animation: fadeInFull 1s ease;
   }
-  .menu-fejlec { text-align: center; margin-bottom: 2rem; }
-  .menu-fejlec h1 { font-family: 'Fredoka One', cursive; font-size: 2.4rem; color: var(--p-green); }
-  .menu-fejlec p { color: var(--p-text); opacity: .7; font-size: .95rem; margin-top: .3rem; }
-  input[type=text] {
+  @keyframes fadeInFull { from { opacity: 0; } to { opacity: 1; } }
+
+  input[type=text], input[type=email], input[type=password], select {
     width: 100%;
-    padding: .8rem 1rem;
-    border: 2px solid var(--p-bg-dark);
-    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
     font-family: 'Nunito', sans-serif;
     font-size: 1rem;
-    background: #fff;
-    color: var(--p-text);
-    transition: border-color .2s;
+    background: rgba(0, 0, 0, 0.3);
+    color: #ffffff;
+    transition: all .2s;
     margin-bottom: 1rem;
+    outline: none;
   }
-  input[type=text]:focus { outline: none; border-color: var(--p-green); }
+  input::placeholder { color: rgba(255, 255, 255, 0.4); }
+  input:focus, select:focus { border-color: var(--p-green); background: rgba(0, 0, 0, 0.5); box-shadow: 0 0 15px rgba(16, 185, 129, 0.2); }
+  select option { background: #0f172a; color: white; }
+
+  .auth-tabs { display: flex; margin-bottom: 1.5rem; gap: 0.5rem; background: rgba(0,0,0,0.3); border-radius: 14px; padding: 0.4rem; }
+  .auth-tab { flex: 1; padding: 0.8rem; border-radius: 10px; border: none; background: transparent; color: var(--p-text); font-weight: 800; cursor: pointer; transition: all 0.2s; opacity: 0.5; }
+  .auth-tab.active { background: var(--p-green); color: white; opacity: 1; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3); }
+  
   .gomb {
     width: 100%;
-    padding: .9rem;
+    padding: 1rem;
     border: none;
-    border-radius: 8px;
+    border-radius: 12px;
     font-family: 'Nunito', sans-serif;
     font-size: 1rem;
-    font-weight: 700;
+    font-weight: 800;
     cursor: pointer;
-    transition: all .2s ease;
-    margin-bottom: .7rem;
-    border-bottom: 3px solid transparent;
+    transition: all .2s cubic-bezier(0.4, 0, 0.2, 1);
+    margin-bottom: .8rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
   }
-  .gomb:active { transform: translateY(2px); border-bottom-width: 1px; }
-  .gomb-fo { background: var(--p-green); color: white; border-bottom-color: #3f613c; }
-  .gomb-fo:hover { background: #6a9467; }
-  .gomb-masodlagos { background: var(--p-bg-dark); color: var(--p-text); border-bottom-color: #c4bfab; }
-  .gomb-masodlagos:hover { background: #d8d2b7; }
-  .szoba-sor { display: flex; gap: .5rem; margin-bottom: 1rem; }
+  .gomb:hover { transform: translateY(-2px); filter: brightness(1.1); }
+  .gomb:active { transform: translateY(0); }
+  .gomb-fo { background: var(--p-green); color: white; box-shadow: 0 8px 20px rgba(16, 185, 129, 0.3); }
+  .gomb-masodlagos { background: rgba(255, 255, 255, 0.05); color: var(--p-text); border: 1px solid rgba(255, 255, 255, 0.1); }
+  .gomb-masodlagos:hover { background: rgba(255, 255, 255, 0.1); }
+
+  .szoba-sor { display: flex; gap: .7rem; margin-bottom: 1rem; }
   .szoba-sor input { margin-bottom: 0; }
-  .szoba-sor .gomb { width: auto; flex-shrink: 0; margin-bottom: 0; padding: .8rem 1.2rem; }
-  .gomb.betolt { pointer-events: none; opacity: 0.7; position: relative; color: transparent !important; }
-  .gomb.betolt::after { content: ""; position: absolute; width: 18px; height: 18px; top: 50%; left: 50%; margin: -9px; border: 3px solid rgba(255,255,255,0.3); border-top-color: white; border-radius: 50%; animation: pörgés 0.6s linear infinite; }
-  @keyframes pörgés { to { transform: rotate(360deg); } }
-  #tutorial { flex-direction: column; align-items: center; justify-content: center; background: var(--p-bg); overflow-y: auto; }
-  .tutorial-kart { background: white; border-radius: 16px; padding: 2rem; width: min(520px, 95vw); box-shadow: 0 8px 24px var(--p-shadow-strong); margin: 1rem 0; }
-  .tutorial-kart h2 { font-family: 'Fredoka One', cursive; color: var(--p-green); font-size: 1.8rem; margin-bottom: 1rem; text-align: center; }
+  .szoba-sor .gomb { width: auto; flex-shrink: 0; margin-bottom: 0; padding: .8rem 1.5rem; }
+
+  #tutorial { flex-direction: column; align-items: center; justify-content: center; background: var(--p-bg); }
+  #tutorial h2 { font-family: 'Fredoka One', cursive; color: var(--p-green); font-size: 2.2rem; margin-bottom: 1.5rem; text-align: center; }
   .tutorial-lepesek { list-style: none; }
-  .tutorial-lepesek li { display: flex; gap: 1rem; align-items: flex-start; padding: .7rem 0; border-bottom: 1px solid #eee; font-size: .95rem; line-height: 1.5; }
+  .tutorial-lepesek li { display: flex; gap: 1.2rem; align-items: flex-start; padding: 1rem 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 1rem; line-height: 1.6; }
   .tutorial-lepesek li:last-child { border-bottom: none; }
-  .tuto-ikon { font-size: 1.5rem; flex-shrink: 0; }
+  .tuto-ikon { font-size: 1.8rem; flex-shrink: 0; filter: drop-shadow(0 0 10px rgba(16, 185, 129, 0.3)); }
+
   #lobby { flex-direction: column; align-items: center; justify-content: center; background: var(--p-bg); }
-  .lobby-kart { background: white; border-radius: 16px; padding: 2rem; width: min(480px, 95vw); box-shadow: 0 8px 24px var(--p-shadow-strong); }
-  .lobby-cim { font-family: 'Fredoka One', cursive; font-size: 2rem; color: var(--p-green); text-align: center; margin-bottom: .3rem; }
-  .szoba-kod { text-align: center; font-size: .9rem; color: var(--p-text); margin-bottom: 1.5rem; }
-  .szoba-kod strong { background: var(--p-bg-dark); padding: .2rem .6rem; border-radius: 8px; font-size: 1rem; cursor: pointer; transition: background .2s; }
-  .jatekos-lista { list-style: none; margin: 1rem 0 1.5rem; }
-  .jatekos-elem { display: flex; align-items: center; gap: .8rem; padding: .6rem; border-radius: 8px; margin-bottom: .4rem; background: var(--p-bg); }
-  .jatekos-avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; flex-shrink: 0; }
-  .jatekos-nev { font-weight: 700; }
-  .varas-szoveg { text-align: center; color: var(--p-text); font-size: .9rem; margin-bottom: 1rem; font-style: italic; }
-  #jatekter { display: none; flex-direction: column; background: #87CEEB; }
+  .lobby-cim { font-family: 'Fredoka One', cursive; font-size: 2.5rem; color: var(--p-green); text-align: center; margin-bottom: .5rem; }
+  .szoba-kod { text-align: center; font-size: 1rem; color: var(--p-text-muted); margin-bottom: 2rem; }
+  .szoba-kod strong { background: rgba(0,0,0,0.3); color: var(--p-accent); padding: .4rem .8rem; border-radius: 10px; font-size: 1.2rem; cursor: pointer; transition: all .2s; border: 1px solid rgba(255,255,255,0.1); }
+  .szoba-kod strong:hover { background: rgba(0,0,0,0.5); transform: scale(1.05); }
+
+  .jatekos-lista { list-style: none; margin: 1rem 0 2rem; }
+  .jatekos-elem { display: flex; align-items: center; gap: 1rem; padding: 1rem; border-radius: 16px; margin-bottom: .6rem; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255,255,255,0.05); }
+  .jatekos-avatar { width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 1.5rem; flex-shrink: 0; }
+  .jatekos-nev { font-weight: 800; font-size: 1.1rem; }
+  .varas-szoveg { text-align: center; color: var(--p-text-muted); font-size: .9rem; margin-bottom: 1.5rem; font-style: italic; }
+
+  #jatekter { display: none; flex-direction: column; background: #020617; }
   #jatekter.aktiv { display: flex; }
   #canvas3d { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
-  .hud { position: absolute; top: 0; left: 0; right: 0; padding: .7rem 1rem; display: flex; align-items: center; gap: .8rem; pointer-events: none; z-index: 10; }
-  .hud-kart { background: rgba(255, 255, 255, 0.8); backdrop-filter: blur(8px); border-radius: 8px; padding: .4rem .8rem; font-weight: 700; font-size: .9rem; color: var(--p-text); pointer-events: auto; box-shadow: 0 2px 8px var(--p-shadow); }
-  .hud-ero { color: #2a9d8f; }
-  .hud-ero-bar { width: 100px; height: 8px; background: rgba(0,0,0,0.2); border-radius: 4px; display: inline-block; vertical-align: middle; margin-left: 5px; overflow: hidden; }
-  .hud-ero-fill { height: 100%; background: #2a9d8f; width: 100%; transition: width 0.3s, background 0.3s; }
-  .hud-jobb { position: absolute; top: .7rem; right: 1rem; display: flex; flex-direction: column; gap: .5rem; z-index: 10; align-items: flex-end; }
+
+  .hud { position: absolute; top: 1.5rem; left: 1.5rem; display: flex; align-items: center; gap: 1rem; pointer-events: none; z-index: 10; }
+  .hud-kart { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); border-radius: 14px; padding: .6rem 1rem; font-weight: 800; font-size: 1rem; color: #fff; pointer-events: auto; box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
+  .hud-ero { color: #2dd4bf; }
+  .hud-ero-bar { width: 120px; height: 10px; background: rgba(255,255,255,0.1); border-radius: 99px; display: inline-block; vertical-align: middle; margin-left: 10px; overflow: hidden; }
+  .hud-ero-fill { height: 100%; background: #2dd4bf; width: 100%; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+
+  .hud-jobb { position: absolute; top: 1.5rem; right: 1.5rem; display: flex; flex-direction: column; gap: .6rem; z-index: 10; align-items: flex-end; }
   .jatekos-hud-lista { list-style: none; }
-  .jatekos-hud-elem { display: flex; align-items: center; gap: .5rem; background: rgba(255, 255, 255, 0.75); backdrop-filter: blur(6px); border-radius: 8px; padding: .3rem .7rem; margin-bottom: .3rem; font-size: .85rem; font-weight: 600; }
-  .jp-szin-gomb { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
-  .iranyitas { position: absolute; bottom: 1.5rem; left: 50%; transform: translateX(-50%); z-index: 10; display: grid; grid-template-areas: ". fel ." "bal le jobb"; gap: .3rem; }
-  .irany-gomb { width: 52px; height: 52px; background: rgba(255, 255, 255, 0.8); backdrop-filter: blur(6px); border: none; border-radius: 16px; font-size: 1.5rem; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all .15s; user-select: none; -webkit-tap-highlight-color: transparent; color: var(--p-text); }
-  .irany-gomb:active { background: var(--p-green); color: white; transform: scale(.9); }
-  .irany-fel { grid-area: fel; }
-  .irany-le { grid-area: le; }
-  .irany-bal { grid-area: bal; }
-  .irany-jobb { grid-area: jobb; }
-  .chat-doboz { position: absolute; bottom: 1.5rem; right: 1rem; width: 220px; z-index: 10; }
-  .chat-uzenetek { background: rgba(255, 255, 255, 0.7); backdrop-filter: blur(6px); border-radius: 8px 8px 0 0; padding: .5rem; max-height: 120px; overflow-y: auto; font-size: .8rem; }
-  .chat-uzenet { margin-bottom: .25rem; line-height: 1.4; }
-  .chat-bevitel-sor { display: flex; gap: .3rem; }
-  .chat-bevitel-sor input { flex: 1; padding: .4rem .7rem; border-radius: 0 0 0 8px; border: none; background: rgba(255, 255, 255, 0.85); font-family: 'Nunito', sans-serif; font-size: .85rem; margin-bottom: 0; }
-  .chat-bevitel-sor input:focus { outline: none; }
-  .chat-kuldes { padding: .4rem .7rem; background: var(--p-green); color: white; border: none; border-radius: 0 0 8px 0; cursor: pointer; font-size: .85rem; }
-  #kviz-panel { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(53, 79, 82, 0.3); backdrop-filter: blur(4px); z-index: 20; }
+  .jatekos-hud-elem { display: flex; align-items: center; gap: .8rem; background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: .5rem 1rem; margin-bottom: .4rem; font-size: .9rem; font-weight: 700; color: #fff; }
+  .jp-szin-gomb { width: 12px; height: 12px; border-radius: 4px; flex-shrink: 0; box-shadow: 0 0 10px currentColor; }
+
+  .iranyitas { position: absolute; bottom: 2rem; left: 50%; transform: translateX(-50%); z-index: 10; display: grid; grid-template-areas: ". fel ." "bal le jobb"; gap: .6rem; }
+  .irany-gomb { width: 64px; height: 64px; background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); border-radius: 18px; font-size: 1.8rem; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all .15s; color: white; user-select: none; }
+  .irany-gomb:active { background: var(--p-green); transform: scale(.9); box-shadow: 0 0 20px var(--p-green); }
+
+  .chat-doboz { position: absolute; bottom: 2rem; right: 2rem; width: 280px; z-index: 10; }
+  .chat-uzenetek { background: rgba(15, 23, 42, 0.6); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px 16px 0 0; padding: 1rem; max-height: 180px; overflow-y: auto; font-size: .9rem; color: #cbd5e1; }
+  .chat-uzenet { margin-bottom: .5rem; line-height: 1.4; }
+  .chat-bevitel-sor { display: flex; gap: .4rem; border: 1px solid rgba(255,255,255,0.1); border-top: none; border-radius: 0 0 16px 16px; overflow: hidden; background: rgba(15, 23, 42, 0.8); }
+  .chat-bevitel-sor input { flex: 1; padding: .8rem 1rem; border: none; background: transparent; color: white; font-size: .9rem; margin-bottom: 0; }
+  .chat-kuldes { padding: 0 1.2rem; background: var(--p-green); color: white; border: none; cursor: pointer; font-size: 1.2rem; }
+
+  #kviz-panel { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(2, 6, 23, 0.6); backdrop-filter: blur(8px); z-index: 20; }
   #kviz-panel.aktiv { display: flex; }
-  .kviz-kart { background: white; border-radius: 16px; padding: 2rem; width: min(480px, 95vw); box-shadow: 0 12px 48px var(--p-shadow-strong); animation: felbukkan .3s ease; }
-  @keyframes felbukkan { from{transform:scale(.8) translateY(20px);opacity:0} to{transform:scale(1) translateY(0);opacity:1} }
-  .kviz-fejlec { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
-  .kviz-kor-jel { background: var(--p-accent); border-radius: 8px; padding: .2rem .7rem; font-size: .85rem; font-weight: 700; color: var(--p-text); }
-  .kviz-ido-jel { background: var(--p-danger); color: white; border-radius: 8px; padding: .2rem .7rem; font-size: .85rem; font-weight: 700; min-width: 60px; text-align: center; transition: background .5s; }
-  .kviz-ido-jel.sietos { background: #c0392b; animation: villog .5s infinite; }
-  @keyframes villog { 0%,100%{opacity:1} 50%{opacity:.5} }
-  .kviz-fa-figyelmeztes { background: #fff3cd; border-left: 4px solid var(--p-accent); border-radius: 0 8px 8px 0; padding: .6rem .9rem; margin-bottom: 1rem; font-size: .9rem; color: #664d03; }
-  .kviz-kerdes { font-size: 1.1rem; font-weight: 700; color: var(--p-text); margin-bottom: 1.2rem; line-height: 1.5; }
-  .kviz-valaszok { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
-  .kviz-valasz { padding: .8rem; border: 2px solid var(--p-bg-dark); border-radius: 8px; background: #fff; cursor: pointer; font-family: 'Nunito', sans-serif; font-size: .9rem; font-weight: 600; text-align: left; transition: all .15s; color: var(--p-text); }
-  .kviz-valasz:hover { border-color: var(--p-green); background: #f8fbf7; }
-  .kviz-valasz.helyes { background: #d1e7dd; border-color: var(--p-green); color: var(--p-green); }
-  .kviz-valasz.helytelen { background: #f8d7da; border-color: var(--p-danger); }
-  .kviz-valasz:disabled { cursor: default; }
-  .kviz-visszajelzes { margin-top: 1rem; padding: .8rem; border-radius: 12px; font-size: .9rem; display: none; }
-  .kviz-visszajelzes.helyes { background: #d1e7dd; color: var(--p-green); display: block; }
-  .kviz-visszajelzes.helytelen { background: #f8d7da; color: #842029; display: block; }
-  #eredmeny-overlay { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(53, 79, 82, 0.4); backdrop-filter: blur(4px); z-index: 25; }
+  .kviz-fejlec { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+  .kviz-kor-jel { background: var(--p-accent); border-radius: 8px; padding: .3rem .8rem; font-size: .9rem; font-weight: 800; color: #000; }
+  .kviz-ido-jel { background: var(--p-danger); color: white; border-radius: 8px; padding: .3rem .8rem; font-size: .9rem; font-weight: 800; min-width: 70px; text-align: center; }
+  .kviz-fa-figyelmeztes { background: rgba(252, 211, 77, 0.1); border-left: 4px solid var(--p-accent); border-radius: 4px; padding: .8rem 1.2rem; margin-bottom: 1.5rem; font-size: 1rem; color: var(--p-accent); font-weight: 600; }
+  .kviz-kerdes { font-size: 1.3rem; font-weight: 800; color: #fff; margin-bottom: 1.5rem; line-height: 1.5; }
+  .kviz-valaszok { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+  .kviz-valasz { padding: 1rem; border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; background: rgba(255,255,255,0.05); cursor: pointer; font-family: 'Nunito', sans-serif; font-size: 1rem; font-weight: 700; text-align: left; transition: all .2s; color: #fff; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+  .kviz-valasz:hover { border-color: var(--p-green); background: rgba(16, 185, 129, 0.1); transform: scale(1.02); box-shadow: 0 0 20px rgba(16, 185, 129, 0.4); }
+  .kviz-valasz.helyes { background: #064e3b; border-color: var(--p-green); color: #fff; box-shadow: 0 0 25px rgba(16, 185, 129, 0.6); }
+  .kviz-valasz.helytelen { background: #450a0a; border-color: var(--p-danger); color: #fff; box-shadow: 0 0 25px rgba(239, 68, 68, 0.4); }
+
+  #eredmeny-overlay { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(2, 6, 23, 0.8); backdrop-filter: blur(12px); z-index: 25; }
   #eredmeny-overlay.aktiv { display: flex; }
-  .eredmeny-kart { background: white; border-radius: 16px; padding: 2rem; width: min(480px, 95vw); text-align: center; animation: felbukkan .3s ease; }
-  .eredmeny-ikon { font-size: 3.5rem; margin-bottom: .5rem; }
-  .eredmeny-cim { font-family: 'Fredoka One', cursive; font-size: 2rem; color: var(--p-green); margin-bottom: .5rem; }
-  .eredmeny-stat { display: flex; justify-content: center; gap: 2rem; margin: 1.2rem 0; }
-  .estat { text-align: center; }
-  .estat-szam { font-family: 'Fredoka One', cursive; font-size: 2rem; color: var(--p-accent); }
-  .estat-felirat { font-size: .85rem; color: var(--p-text); opacity: .7; }
-  .rangsor { list-style: none; margin: 1rem 0; text-align: left; }
-  .rangsor-elem { display: flex; align-items: center; gap: .8rem; padding: .5rem .7rem; border-radius: 8px; margin-bottom: .3rem; background: var(--p-bg); font-weight: 600; }
-  .rangsor-szam { font-family: 'Fredoka One', cursive; font-size: 1.2rem; color: var(--p-text); opacity: .6; width: 24px; }
-  .rangsor-pont { margin-left: auto; color: var(--p-accent); font-size: .9rem; }
-  #ertesitesek { position: absolute; top: 4rem; left: 50%; transform: translateX(-50%); z-index: 30; display: flex; flex-direction: column; align-items: center; gap: .4rem; pointer-events: none; width: min(400px, 90vw); }
-  .ertesites { background: rgba(53, 79, 82, 0.9); color: white; border-radius: 8px; padding: .6rem 1.2rem; font-size: .9rem; font-weight: 600; box-shadow: 0 4px 16px var(--p-shadow-strong); animation: ertesites-be .3s ease, ertesites-ki .3s ease 3.7s forwards; text-align: center; }
-  @keyframes ertesites-be { from{transform:translateY(-20px);opacity:0} to{transform:translateY(0);opacity:1} }
-  @keyframes ertesites-ki { to{transform:translateY(-20px);opacity:0} }
-  .haladassav-tartaly { position: absolute; bottom: 8rem; left: 50%; transform: translateX(-50%); width: min(280px, 60vw); z-index: 10; }
-  .haladassav-cimke { text-align: center; font-size: .8rem; font-weight: 700; color: white; text-shadow: 0 1px 3px rgba(0,0,0,.4); margin-bottom: .3rem; }
-  .haladassav-hatter { height: 10px; background: rgba(255,255,255,.4); border-radius: 99px; overflow: hidden; }
-  .haladassav-tolt { height: 100%; background: var(--p-accent); border-radius: 99px; transition: width .5s ease; box-shadow: 0 0 8px rgba(233, 196, 106, 0.8); }
+  .eredmeny-ikon { font-size: 5rem; margin-bottom: 1rem; filter: drop-shadow(0 0 20px rgba(16, 185, 129, 0.4)); }
+  .eredmeny-cim { font-family: 'Fredoka One', cursive; font-size: 3rem; color: var(--p-green); margin-bottom: 1rem; }
+  .eredmeny-stat { display: flex; justify-content: center; gap: 3rem; margin: 2rem 0; }
+  .estat-szam { font-family: 'Fredoka One', cursive; font-size: 3rem; color: var(--p-accent); line-height: 1; }
+  .estat-felirat { font-size: 1rem; color: var(--p-text-muted); margin-top: .5rem; }
+
+  .rangsor { list-style: none; margin: 1.5rem 0; text-align: left; }
+  .rangsor-elem { display: flex; align-items: center; gap: 1rem; padding: .8rem 1.2rem; border-radius: 14px; margin-bottom: .5rem; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); font-weight: 700; }
+  .rangsor-szam { font-family: 'Fredoka One', cursive; font-size: 1.4rem; color: var(--p-text-muted); width: 30px; }
+  .rangsor-pont { margin-left: auto; color: var(--p-accent); font-size: 1.1rem; }
+
+  #ertesitesek { position: absolute; top: 6rem; left: 50%; transform: translateX(-50%); z-index: 30; display: flex; flex-direction: column; align-items: center; gap: .6rem; pointer-events: none; width: min(400px, 90vw); }
+  .ertesites { background: rgba(15, 23, 42, 0.9); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); color: white; border-radius: 12px; padding: .8rem 1.5rem; font-size: 1rem; font-weight: 700; box-shadow: 0 10px 30px rgba(0,0,0,0.5); animation: ertesites-be .3s cubic-bezier(0.4, 0, 0.2, 1), ertesites-ki .3s ease 3.7s forwards; text-align: center; }
+
+  .haladassav-tartaly { position: absolute; bottom: 10rem; left: 50%; transform: translateX(-50%); width: min(320px, 70vw); z-index: 10; }
+  .haladassav-cimke { text-align: center; font-size: 1rem; font-weight: 900; color: white; text-shadow: 0 2px 10px rgba(0,0,0,0.5); margin-bottom: .6rem; letter-spacing: 1px; }
+  .haladassav-hatter { height: 14px; background: rgba(0,0,0,0.4); border-radius: 99px; border: 1px solid rgba(255,255,255,0.1); overflow: hidden; padding: 2px; }
+  .haladassav-tolt { height: 100%; background: linear-gradient(90deg, var(--p-green), #34d399); border-radius: 99px; transition: width 1s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 0 15px rgba(16, 185, 129, 0.5); }
+
   @media (max-width: 480px) {
     .kviz-valaszok { grid-template-columns: 1fr; }
     .kviz-kart { padding: 1.5rem; }
-    .iranyitas { bottom: 1rem; }
     .chat-doboz { display: none; }
+    .hud { left: 1rem; top: 1rem; flex-wrap: wrap; }
+    .hud-jobb { right: 1rem; top: 1rem; }
   }
 </style>
 </head>
@@ -777,17 +974,97 @@ HTML_TARTALOM = r"""<!DOCTYPE html>
 <div id="fomenu" class="kepernyo">
   <div class="menu-kart">
     <div class="menu-fejlec">
-      <h1>Erdővédők</h1>
-      <p>Hívd meg barátaidat is (LAN IP: <strong>{{LOCAL_IP}}:8764</strong>)</p>
+      <h1 class="logo-cim" style="font-size: 4rem; margin-bottom: 0;">Erdővédők</h1>
+      <p class="logo-al" style="margin-bottom: 2rem;">A természet védelme a te kezedben van.</p>
     </div>
-    <input type="text" id="nev-input" placeholder="Add meg a neved..." maxlength="20">
-    <button id="uj-jatek-gomb" class="gomb gomb-fo" onclick="jatek_inditasa(this)">Új Játék</button>
-    <div class="szoba-sor">
-      <input type="text" id="szoba-input" placeholder="Szoba kód..." maxlength="12">
-      <button id="csat-gomb" class="gomb gomb-masodlagos" onclick="szobaba_csatlakozas(this)" style="white-space:nowrap">Csatlakozás</button>
+    
+    <div id="auth-section">
+      <div class="auth-tabs" id="auth-tabs">
+        <button class="auth-tab active" id="tab-login">Belépés</button>
+        <button class="auth-tab" id="tab-register">Regisztráció</button>
+      </div>
+      
+      <div id="login-form">
+        <input type="email" id="login-email" placeholder="E-mail cím" maxlength="50">
+        <input type="password" id="login-pass" placeholder="Jelszó" maxlength="50">
+        <button class="gomb gomb-fo" id="btn-do-login">Belépés az Erdőbe</button>
+      </div>
+      
+      <div id="register-form" style="display:none;">
+        <input type="text" id="reg-name" placeholder="Játékosnév (pl. FaManó)" maxlength="20">
+        <select id="reg-country">
+            <option value="" disabled selected>Válassz országot...</option>
+            <option value="Magyarország">Magyarország</option>
+            <option value="Románia">Románia</option>
+            <option value="Szlovákia">Szlovákia</option>
+            <option value="Szerbia">Szerbia</option>
+            <option value="Ausztria">Ausztria</option>
+            <option value="Egyéb">Egyéb</option>
+        </select>
+        <input type="email" id="reg-email" placeholder="E-mail cím" maxlength="50">
+        <input type="password" id="reg-pass" placeholder="Jelszó (min. 6 karakter)" maxlength="50">
+        <button class="gomb gomb-fo" id="btn-do-register">Fiók Létrehozása</button>
+      </div>
+      
+      <p id="auth-msg-local" style="color: var(--p-danger); font-size: 0.9rem; text-align: center; font-weight: 700; min-height: 24px; margin-top: 1rem;"></p>
     </div>
-    <button class="gomb gomb-masodlagos" onclick="tutorial_mutat()">Hogyan játsszak?</button>
+
+    <div id="play-section" style="display:none; flex-direction: row; gap: 4rem; align-items: stretch; width: 100%; max-width: 1200px;">
+      <div style="flex: 1.2; display: flex; flex-direction: column; justify-content: center;">
+        <p style="margin-bottom: 3rem; font-weight: 900; text-align: center; font-size: 2.5rem; color: #fff;">Üdv újra, <span id="welcome-name" style="color:var(--p-green); text-shadow: 0 0 20px rgba(16,185,129,0.5);"></span>!</p>
+        <button id="uj-jatek-gomb" class="gomb gomb-fo" onclick="jatek_inditasa(this)" style="padding: 2rem; font-size: 1.5rem;">✨ Új Játék Indítása</button>
+        <div class="szoba-sor" style="gap: 1.5rem;">
+          <input type="text" id="szoba-input" placeholder="Szoba kód..." maxlength="12" style="padding: 1.5rem;">
+          <button id="csat-gomb" class="gomb gomb-masodlagos" onclick="szobaba_csatlakozas(this)" style="white-space:nowrap; padding: 1.5rem 3rem;">Csatlakozás</button>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-top: 1.5rem;">
+            <button class="gomb gomb-masodlagos" onclick="tutorial_mutat()" style="padding: 1.2rem;">📖 Útmutató</button>
+            <button class="gomb gomb-masodlagos" onclick="settings_mutat()" style="padding: 1.2rem;">⚙️ Beállítások</button>
+        </div>
+        
+        <div style="margin-top: 3rem; padding-top: 2rem; border-top: 1px solid rgba(255,255,255,0.1); text-align: center;">
+          <p style="font-size: 0.9rem; color: var(--p-text-muted); cursor: pointer;" onclick="document.getElementById('server-info').style.display='block'; this.style.display='none'">Technikai adatok ↓</p>
+          <div id="server-info" style="display:none;">
+            <p style="font-size: 1rem; color: var(--p-text-muted);">IP: <strong style="color:var(--p-accent);">{{LOCAL_IP}}</strong> | Port: <strong>8764</strong></p>
+          </div>
+          <p style="font-size: 0.8rem; color: rgba(255,255,255,0.3); margin-top: 2rem;">Kilépés: ESC billentyű</p>
+        </div>
+      </div>
+      
+      <div style="flex: 0.8; background: rgba(0,0,0,0.3); border-radius: 32px; padding: 2.5rem; display: flex; flex-direction: column; border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(10px);">
+        <h3 style="text-align: center; margin-bottom: 2rem; font-family: 'Fredoka One'; color: var(--p-accent); font-size: 1.8rem;">🏆 Top Erdővédők</h3>
+        <ul id="leaderboard-list" style="list-style: none; flex: 1; display: flex; flex-direction: column; gap: 1.2rem;">
+            <li style="text-align: center; color: var(--p-text-muted); font-size: 1.1rem;">Betöltés...</li>
+        </ul>
+        <p style="text-align: center; font-size: 0.9rem; color: var(--p-text-muted); margin-top: 2rem;">V2.0 | Fullscreen Edition</p>
+      </div>
+    </div>
   </div>
+</div>
+
+<div id="settings" class="kepernyo">
+    <div class="menu-kart" style="width: min(500px, 90vw); height: auto;">
+        <h2 style="font-family: 'Fredoka One'; color: var(--p-green); text-align: center; margin-bottom: 2rem;">⚙️ Beállítások</h2>
+        <div style="display: flex; flex-direction: column; gap: 1.5rem; margin-bottom: 2rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span>Hangeffektek</span>
+                <input type="checkbox" checked style="width: 20px; height: 20px;">
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span>Zene</span>
+                <input type="checkbox" checked style="width: 20px; height: 20px;">
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span>Grafikai minőség</span>
+                <select style="width: auto; margin-bottom: 0; padding: 0.5rem 1rem;">
+                    <option>Magas</option>
+                    <option>Közepes</option>
+                    <option>Alacsony</option>
+                </select>
+            </div>
+        </div>
+        <button class="gomb gomb-fo" onclick="kepernyo_valt('fomenu')">Mentés és Vissza</button>
+    </div>
 </div>
 
 <div id="tutorial" class="kepernyo">
@@ -834,12 +1111,7 @@ HTML_TARTALOM = r"""<!DOCTYPE html>
     <div class="haladassav-cimke">🌿 Erdő védelme</div>
     <div class="haladassav-hatter"><div class="haladassav-tolt" id="haladassav" style="width:100%"></div></div>
   </div>
-  <div class="iranyitas">
-    <button class="irany-gomb irany-fel" ontouchstart="mozgas_kezd('fel')" ontouchend="mozgas_vege('fel')" onmousedown="mozgas_kezd('fel')" onmouseup="mozgas_vege('fel')">▲</button>
-    <button class="irany-gomb irany-bal" ontouchstart="mozgas_kezd('bal')" ontouchend="mozgas_vege('bal')" onmousedown="mozgas_kezd('bal')" onmouseup="mozgas_vege('bal')">◀</button>
-    <button class="irany-gomb irany-le" ontouchstart="mozgas_kezd('le')" ontouchend="mozgas_vege('le')" onmousedown="mozgas_kezd('le')" onmouseup="mozgas_vege('le')">▼</button>
-    <button class="irany-gomb irany-jobb" ontouchstart="mozgas_kezd('jobb')" ontouchend="mozgas_vege('jobb')" onmousedown="mozgas_kezd('jobb')" onmouseup="mozgas_vege('jobb')">▶</button>
-  </div>
+  <div class="ertesites-tartaly" id="ertesitesek"></div>
   <div class="chat-doboz">
     <div class="chat-uzenetek" id="chat-uzenetek"></div>
     <div class="chat-bevitel-sor">
@@ -1251,6 +1523,12 @@ function ws_csatlakozes(nev, szoba_kod) {
 
 function uzenet_kezel(uzenet) {
   switch(uzenet.tipus) {
+    case 'hiba': 
+        if (uzenet.uzenet.includes('létezik')) {
+            document.querySelectorAll('.betolt').forEach(b => b.classList.remove('betolt'));
+        }
+        ertesites_mutat(uzenet.uzenet, '#f8d7da'); 
+        break;
     case 'csatlakozva': szoba_id = uzenet.szoba_id; sajat_nev = uzenet.te_neved; sajat_szin = uzenet.te_szined; document.getElementById('szoba-kod-jel').textContent = szoba_id; kepernyo_valt('lobby'); break;
     case 'allapot': jatek_allapot = uzenet.jatek; vilag_jatekosok = uzenet.jatekosok; vilag_fak = uzenet.jatek.fak; lobby_frissit(uzenet.jatekosok); hud_frissit(); break;
     case 'jatekosok_mozgas': vilag_jatekosok = uzenet.jatekosok; jatekos_hud_frissit(uzenet.jatekosok); break;
@@ -1293,6 +1571,13 @@ let mozgas_ido = 0;
 function mozgas_kezd(irany) { mozgas_allapot[irany] = true; }
 function mozgas_vege(irany) { mozgas_allapot[irany] = false; }
 document.addEventListener('keydown', e => { 
+  if (e.key === 'Escape') {
+    if (confirm("Biztosan ki szeretnél lépni a játékból?")) {
+        window.pywebview.api.close_window();
+    }
+    return;
+  }
+  if (document.activeElement.tagName === 'INPUT') return;
   if (['ArrowUp','w','W'].includes(e.key)) mozgas_allapot.fel = true; 
   if (['ArrowDown','s','S'].includes(e.key)) mozgas_allapot.le = true; 
   if (['ArrowLeft','a','A'].includes(e.key)) mozgas_allapot.bal = true; 
@@ -1300,6 +1585,7 @@ document.addEventListener('keydown', e => {
   if (e.key === ' ' && sajat_jatekos.foldon) { sajat_jatekos.vy = 0.5; sajat_jatekos.foldon = false; hang(300, 'sine', 0.1, 0.2); }
 });
 document.addEventListener('keyup', e => { 
+  if (document.activeElement.tagName === 'INPUT') return;
   if (['ArrowUp','w','W'].includes(e.key)) mozgas_allapot.fel = false; 
   if (['ArrowDown','s','S'].includes(e.key)) mozgas_allapot.le = false; 
   if (['ArrowLeft','a','A'].includes(e.key)) mozgas_allapot.bal = false; 
@@ -1455,20 +1741,21 @@ function kod_masol(element) { const kod = document.getElementById('szoba-kod-jel
 
 function jatek_inditasa(btn) { 
   if (btn) btn.classList.add('betolt');
-  const nev = document.getElementById('nev-input').value.trim() || `Játékos_${Math.floor(Math.random()*1000)}`; 
+  const nev = window.global_name || `Játékos_${Math.floor(Math.random()*1000)}`; 
   sajat_nev = nev; 
   ws_csatlakozes(nev, null); 
 }
 
 function szobaba_csatlakozas(btn) { 
   if (btn) btn.classList.add('betolt');
-  const nev = document.getElementById('nev-input').value.trim() || `Játékos_${Math.floor(Math.random()*1000)}`; 
+  const nev = window.global_name || `Játékos_${Math.floor(Math.random()*1000)}`; 
   const szoba = document.getElementById('szoba-input').value.trim(); 
   sajat_nev = nev; 
   ws_csatlakozes(nev, szoba || null); 
 }
 
 function tutorial_mutat() { kepernyo_valt('tutorial'); }
+function settings_mutat() { kepernyo_valt('settings'); }
 
 function jatek_indit_keres() { if (!ws) return; ws.send(JSON.stringify({ tipus: 'jatek_indit' })); audioInit(); }
 
@@ -1478,6 +1765,18 @@ function ujra_jatek(btn) {
 }
 
 window.addEventListener('load', () => { setTimeout(() => { kepernyo_valt('fomenu'); }, 2200); });
+</script>
+<script>
+    // Fireflies in Desktop app
+    for(let i=0; i<30; i++){
+        const f = document.createElement('div');
+        f.className = 'firefly';
+        f.style.left = Math.random() * 100 + 'vw';
+        f.style.top = Math.random() * 100 + 'vh';
+        f.style.animationDuration = (Math.random() * 10 + 10) + 's, ' + (Math.random() * 3 + 2) + 's';
+        f.style.animationDelay = (Math.random() * 5) + 's, ' + (Math.random() * 5) + 's';
+        document.body.appendChild(f);
+    }
 </script>
 </body>
 </html>
@@ -1547,13 +1846,20 @@ if __name__ == "__main__":
         ws_thread = threading.Thread(target=start_async_loop, args=(loop,), daemon=True)
         ws_thread.start()
         
-        # Open standalone window
-        webview.create_window(
+        # API class for JS communication
+        class Api:
+            def close_window(self):
+                window.destroy()
+
+        # Open standalone window in Fullscreen mode
+        window = webview.create_window(
             'Erdővédők 🌳', 
             'http://localhost:8764', 
-            width=1100, 
-            height=800,
-            background_color='#fefae0'
+            width=1280, 
+            height=720,
+            fullscreen=True,
+            background_color='#020617',
+            js_api=Api()
         )
         webview.start()
         
